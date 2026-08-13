@@ -47,11 +47,38 @@ python -m gameplay_clipper.splice            # 默认不覆盖
 python -m gameplay_clipper.splice --overwrite  # 允许覆盖
 ```
 
+### highlight —— 检测精彩片段并生成集锦
+
+从长录像中自动检测精彩时刻，裁剪成片段（可接 splice 拼成集锦）。
+检测器可插拔，`highlight.py` 配置区用 `DETECTOR` 选择：
+
+| 检测器 | 说明 | 适用 |
+| --- | --- | --- |
+| `coarse` | ffmpeg 音频能量 + 画面变化粗筛（零依赖） | 任何机器，效果一般 |
+| `manual` | 手动标记（`detectors/manual.py` 配置区写时间点） | 最可靠的兜底 |
+| `vlm` | 本地视觉大模型精判（`Qwen2.5-VL-7B-AWQ`） | 需 GPU（4080S 可跑），效果最好 |
+
+- 流程：检测 → 按分数取 top-N（间隔约束）→ 复用 cut 无损裁剪到
+  `highlight_output/` → `AUTO_SPLICE=True` 时自动调 splice 拼接
+- 配置：`SOURCE`、`DETECTOR`、`HIGHLIGHT_COUNT`、`MIN_GAP`、
+  `OUTPUT_DIR` / `OUTPUT_PREFIX`、`AUTO_SPLICE`
+- vlm 检测器：抽帧间隔、判定阈值、prompt 等见 `detectors/vlm.py` 配置区；
+  帧判定结果缓存到 `highlight_output/.vlm_cache.json`，中断可续跑
+
+```bash
+python -m gameplay_clipper.highlight            # 默认不覆盖
+python -m gameplay_clipper.highlight --overwrite  # 允许覆盖
+```
+
+vlm 检测器需在真机（GPU）的 WSL2 环境安装依赖：
+`pip install torch transformers qwen-vl-utils accelerate pillow`
+（国内下载模型可设 `HF_ENDPOINT=https://hf-mirror.com`）
+
 ## 规划中的功能
 
-| 子命令      | 功能                   |
-| ----------- | ---------------------- |
-| `highlight` | 挑选片段并生成精彩集锦 |
+| 子命令 | 功能 |
+| --- | --- |
+| 音频事件/击杀 OCR 检测器 | vlm 检测器的可插拔插件位（预留） |
 
 ## 开发环境
 
@@ -76,7 +103,9 @@ gameplay-clipper/
 │   └── gameplay_clipper/   # 主包（src 布局）
 │       ├── cut.py          # 无损裁剪
 │       ├── splice.py       # 拼接 + 转场
-│       └── common.py       # 共享工具（输出命名）
+│       ├── highlight.py    # 精彩集锦编排
+│       ├── common.py       # 共享工具（输出命名）
+│       └── detectors/      # 精彩时刻检测器（coarse/manual/vlm）
 └── tests/                  # 测试
 ```
 
