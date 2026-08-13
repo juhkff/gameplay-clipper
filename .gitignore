@@ -1,0 +1,27 @@
+# Reasonix 工具状态目录
+.reasonix/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# 测试与工具缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 编辑器
+.idea/
+.vscode/
+
+# 素材与输出（约定：不把视频素材/产物提交进仓库）
+media/
+output/
+*.mp4
+*.mov
+*.mkv
+*.ts
