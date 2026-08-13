@@ -22,16 +22,18 @@ import subprocess
 import sys
 from pathlib import Path
 
+from gameplay_clipper.common import next_output_path  # noqa: F401  # re-export
+
 # ============================================================
 # 配置区（按需修改；支持任意多段裁剪）
 # ============================================================
-VIDEO_PATH: str = "video.mp4"  # 待裁剪的视频（相对当前运行目录，或绝对路径）
+VIDEO_PATH: str = "media/video.mp4"  # 待裁剪视频（素材统一放 media/，相对运行目录或绝对路径）
 CLIPS: list[tuple[str, str]] = [
     # (起点, 终点)；时间格式支持 HH:MM:SS、MM:SS、秒数（可为小数）
     ("00:00:05", "00:00:30"),
     ("00:01:00", "00:02:00"),
 ]
-OUTPUT_DIR: str = "output"  # 输出目录（相对当前运行目录，或绝对路径）
+OUTPUT_DIR: str = "cut_output"  # 输出目录（相对当前运行目录，或绝对路径）
 OUTPUT_PREFIX: str = "clip"  # 输出文件名前缀，如 clip-1.mp4、clip-2.mp4
 # ============================================================
 
@@ -41,33 +43,13 @@ def parse_time(value: str) -> float:
     try:
         parts = [float(p) for p in value.split(":")]
     except ValueError:
-        raise ValueError(
-            f"无法解析时间 {value!r}，支持 HH:MM:SS、MM:SS 或秒数"
-        ) from None
+        raise ValueError(f"无法解析时间 {value!r}，支持 HH:MM:SS、MM:SS 或秒数") from None
     if not 1 <= len(parts) <= 3 or any(p < 0 for p in parts):
-        raise ValueError(
-            f"无法解析时间 {value!r}，支持 HH:MM:SS、MM:SS 或秒数"
-        )
+        raise ValueError(f"无法解析时间 {value!r}，支持 HH:MM:SS、MM:SS 或秒数")
     seconds = 0.0
     for part in parts:
         seconds = seconds * 60 + part
     return seconds
-
-
-def next_output_path(
-    directory: Path, prefix: str, suffix: str, overwrite: bool
-) -> Path:
-    """确定下一个输出文件路径：clip-1{suffix}、clip-2{suffix}……
-
-    overwrite=False 时跳过已存在的编号，保证不会覆盖；
-    overwrite=True 时始终从 clip-1 开始（由 ffmpeg -y 负责覆盖）。
-    """
-    directory.mkdir(parents=True, exist_ok=True)
-    for index in range(1, 1_000_000):
-        candidate = directory / f"{prefix}-{index}{suffix}"
-        if overwrite or not candidate.exists():
-            return candidate
-    raise RuntimeError("找不到可用的输出文件名")
 
 
 def cut_segment(
@@ -108,9 +90,7 @@ def cut_segment(
         if tmp.exists():
             tmp.unlink()  # 非覆盖模式下清理失败残留；覆盖模式下不动已存在的正式文件
         tail = exc.stderr.strip().splitlines()[-5:]
-        raise RuntimeError(
-            f"裁剪失败（起点 {start}，终点 {end}）：" + " | ".join(tail)
-        ) from exc
+        raise RuntimeError(f"裁剪失败（起点 {start}，终点 {end}）：" + " | ".join(tail)) from exc
     tmp.replace(output)
 
 
