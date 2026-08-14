@@ -47,38 +47,28 @@ python -m gameplay_clipper.splice            # 默认不覆盖
 python -m gameplay_clipper.splice --overwrite  # 允许覆盖
 ```
 
-### highlight —— 检测精彩片段并生成集锦
+### highlight —— 收集高光片段并生成集锦
 
-从长录像中自动检测精彩时刻，裁剪成片段（可接 splice 拼成集锦）。
-检测器可插拔，`highlight.py` 配置区用 `DETECTOR` 选择：
+收集专业录制工具（Outplayed / Medal.tv / NVIDIA Highlights 等）自动检测并
+录制的**成品高光片段**，复制到 `highlight_output/`，可选自动 splice 拼接成集锦。
+游戏事件驱动的高光准确度远高于算法检测，且零检测成本。
 
-| 检测器 | 说明 | 适用 |
-| --- | --- | --- |
-| `coarse` | ffmpeg 音频能量 + 画面变化粗筛（零依赖） | 任何机器，效果一般 |
-| `manual` | 手动标记（`detectors/manual.py` 配置区写时间点） | 最可靠的兜底 |
-| `vlm` | 本地视觉大模型精判（`Qwen2.5-VL-7B-AWQ`） | 需 GPU（4080S 可跑），效果最好 |
-
-- 流程：检测 → 按分数取 top-N（间隔约束）→ 复用 cut 无损裁剪到
-  `highlight_output/` → `AUTO_SPLICE=True` 时自动调 splice 拼接
-- 配置：`SOURCE`、`DETECTOR`、`HIGHLIGHT_COUNT`、`MIN_GAP`、
-  `OUTPUT_DIR` / `OUTPUT_PREFIX`、`AUTO_SPLICE`
-- vlm 检测器：抽帧间隔、判定阈值、prompt 等见 `detectors/vlm.py` 配置区；
-  帧判定结果缓存到 `highlight_output/.vlm_cache.json`，中断可续跑
+- 流程：收集成品高光 → 复制到 `highlight_output/` → `AUTO_SPLICE=True` 时
+  自动调 splice 拼接（收集到多少就处理多少，不设上限）
+- 高光目录配置（`highlight.py` 顶部配置区）：
+  - `CLIPS_DIRS`：一个或多个高光目录（支持同时配置多个工具）
+  - `RECURSIVE` / `FILE_PATTERNS`：扫描方式与文件后缀
+  - `EXCLUDE_NAME_PATTERNS`：按文件名正则排除非高光文件（如整场录像）
+- 集锦配置（`highlight.py` 顶部配置区，同一文件）：
+  - `OUTPUT_DIR` / `OUTPUT_PREFIX`：输出目录与文件名前缀
+  - `AUTO_SPLICE`：收集后自动拼接（输出到 `connect_output/`）
+- 转场效果配置在 `splice.py`（`TRANSITION` / `TRANSITION_POOL` / `TRANSITION_DURATION`）
+- 片段直接复制不重编码；WSL 中 Windows 路径写作 `/mnt/c/Users/<user>/Videos/...`
 
 ```bash
 python -m gameplay_clipper.highlight            # 默认不覆盖
 python -m gameplay_clipper.highlight --overwrite  # 允许覆盖
 ```
-
-vlm 检测器需在真机（GPU）的 WSL2 环境安装依赖：
-`pip install torch transformers qwen-vl-utils accelerate pillow`
-（国内下载模型可设 `HF_ENDPOINT=https://hf-mirror.com`）
-
-## 规划中的功能
-
-| 子命令 | 功能 |
-| --- | --- |
-| 音频事件/击杀 OCR 检测器 | vlm 检测器的可插拔插件位（预留） |
 
 ## 开发环境
 
@@ -103,9 +93,8 @@ gameplay-clipper/
 │   └── gameplay_clipper/   # 主包（src 布局）
 │       ├── cut.py          # 无损裁剪
 │       ├── splice.py       # 拼接 + 转场
-│       ├── highlight.py    # 精彩集锦编排
-│       ├── common.py       # 共享工具（输出命名）
-│       └── detectors/      # 精彩时刻检测器（coarse/manual/vlm）
+│       ├── highlight.py    # 精彩集锦（收集高光 → 复制 → 可选拼接）
+│       └── common.py       # 共享工具（输出命名）
 └── tests/                  # 测试
 ```
 
