@@ -16,7 +16,8 @@ dist/
 
 # 编辑器
 .idea/
-.vscode/
+.vscode/*
+!.vscode/launch.json.template
 
 # 素材与输出（约定：不把视频素材/产物提交进仓库）
 media/

@@ -1,0 +1,60 @@
+{
+  // gameplay-clipper 调试配置模板
+  // 用法：复制本文件为 .vscode/launch.json（cp .vscode/launch.json.template .vscode/launch.json），
+  // 然后 VS Code 中 F5 启动当前选中的配置；输入路径请在对应模块顶部的「配置区」修改
+  // 注意：.vscode/ 已被 .gitignore 忽略，仅本模板文件通过例外规则可提交入库
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "cut：裁剪片段",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "gameplay_clipper.cut",
+      // 传 --exact 切到帧级精确重编码；传 --overwrite 允许覆盖输出
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "splice：拼接 + 转场",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "gameplay_clipper.splice",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "highlight：收集高光集锦",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "gameplay_clipper.highlight",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "bgm：背景音乐混音",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "gameplay_clipper.bgm",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "compress：压缩转码",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "gameplay_clipper.compress",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "console": "integratedTerminal"
+    }
+  ]
+}
