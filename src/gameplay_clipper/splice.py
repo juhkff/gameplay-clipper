@@ -32,7 +32,8 @@ OUTPUT_DIR: str = "connect_output"  # 输出目录（相对当前运行目录，
 OUTPUT_PREFIX: str = "connect"  # 输出文件名前缀，如 connect-1.mp4
 
 # 片段间转场效果。填某个具体名字（如 "fade"）则所有转场均用该效果；
-# 填 "random" 则每对相邻片段从 TRANSITION_POOL 中随机选一个。
+# 填 "random" 则每对相邻片段从 TRANSITION_POOL 中随机选一个；
+# 填 "none" 则不添加转场，纯拼接（concat 无缝衔接，成片时长 = 各段时长之和）。
 TRANSITION: str = "random"
 TRANSITION_POOL: list[str] = ["fade", "dissolve", "wipeleft"]
 
@@ -40,6 +41,11 @@ TRANSITION_DURATION: float = 1.0  # 转场时长（秒）；每段视频时长�
 CRF: str = "23"  # x264 质量（越小越好，18 高质量 / 23 均衡 / 28 省体积）
 PRESET: str = "medium"  # x264 速度预设
 VIDEO_EXTS: set[str] = {".mp4", ".mkv", ".mov", ".ts", ".flv", ".webm", ".avi"}
+
+# 成片首尾淡入淡出（秒；设为 0 关闭）。片头淡入、片尾淡出，
+# 分别作用于整条拼接链的最后一级（视频 fade + 音频 afade）。
+FADE_IN: float = 0.5
+FADE_OUT: float = 1.0
 
 # 可用转场效果（本机 ffmpeg 的 xfade 支持列表，程序启动时动态读取校验，
 # 可复制到 TRANSITION 或 TRANSITION_POOL 中）：
@@ -221,8 +227,13 @@ def clip_info_from_probe(path: Path, data: dict) -> ClipInfo:
 
 
 def pick_transitions(clips: list[ClipInfo], transition: str, pool: list[str]) -> list[str]:
-    """返回 N-1 个转场名：固定转场全部相同；random 从 pool 中随机选择。"""
+    """返回 N-1 个转场名。
+
+    固定转场全部相同；random 从 pool 中随机选择；none 返回空列表（纯拼接）。
+    """
     pairs = len(clips) - 1
+    if transition == "none":
+        return []
     if transition == "random":
         return [random.choice(pool) for _ in range(pairs)]
     return [transition] * pairs
@@ -232,11 +243,15 @@ def build_filter_complex(
     clips: list[ClipInfo],
     transitions: list[str],
     duration: float,
+    fade_in: float = 0.0,
+    fade_out: float = 0.0,
 ) -> str:
     """构建 ffmpeg filter_complex：视频 xfade 链 + 音频 acrossfade 链。
 
     所有片段统一到第一个片段的分辨率与帧率；音频统一为 48kHz 立体声，
     无音轨的片段用静音填充。转场 offset 按各段时长精确计算。
+    最后一级统一输出标签 vout/aout：fade_in/fade_out 大于 0 时追加
+    视频 fade + 音频 afade 首尾淡入淡出，否则用 null/anull 原样透传。
     """
     width, height = clips[0].width, clips[0].height
     fps = max(clips[0].fps, *(c.fps for c in clips[1:]))
@@ -263,25 +278,53 @@ def build_filter_complex(
                 f"asetpts=PTS-STARTPTS[a{i}]"
             )
 
-    # 视频 xfade 链：offset 为“已拼接总时长 - 转场时长”；最后一步输出固定标签 vout
-    acc = clips[0].duration
-    v_prev = "v0"
-    for i in range(1, len(clips)):
-        offset = acc - duration
-        out_label = f"xv{i}" if i < len(clips) - 1 else "vout"
-        parts.append(
-            f"[{v_prev}][v{i}]xfade=transition={transitions[i - 1]}:"
-            f"duration={duration}:offset={offset:.6f}[{out_label}]"
-        )
-        acc = acc + clips[i].duration - duration
-        v_prev = out_label
+    # 拼接链：无转场用 concat 无缝拼接（transitions 为空），
+    # 有转场用 xfade + acrossfade；最后一步均输出 vlast/alast，
+    # 由末尾的 fade（或 null）链统一转成 vout/aout
+    if not transitions:
+        # concat 要求各输入同分辨率/帧率（视频）与同采样率/声道/格式（音频），
+        # 上面的预处理链已统一；成片时长 = 各段时长之和
+        interleaved = []
+        for i in range(len(clips)):
+            interleaved += [f"[v{i}]", f"[a{i}]"]
+        parts.append("".join(interleaved) + f"concat=n={len(clips)}:v=1:a=1[vlast][alast]")
+        acc = sum(c.duration for c in clips)
+    else:
+        # 视频 xfade 链：offset 为“已拼接总时长 - 转场时长”
+        acc = clips[0].duration
+        v_prev = "v0"
+        for i in range(1, len(clips)):
+            offset = acc - duration
+            out_label = f"xv{i}" if i < len(clips) - 1 else "vlast"
+            parts.append(
+                f"[{v_prev}][v{i}]xfade=transition={transitions[i - 1]}:"
+                f"duration={duration}:offset={offset:.6f}[{out_label}]"
+            )
+            acc = acc + clips[i].duration - duration
+            v_prev = out_label
 
-    # 音频 acrossfade 链；最后一步输出固定标签 aout
-    a_prev = "a0"
-    for i in range(1, len(clips)):
-        out_label = f"xa{i}" if i < len(clips) - 1 else "aout"
-        parts.append(f"[{a_prev}][a{i}]acrossfade=d={duration}[{out_label}]")
-        a_prev = out_label
+        # 音频 acrossfade 链；最后一步输出 alast
+        a_prev = "a0"
+        for i in range(1, len(clips)):
+            out_label = f"xa{i}" if i < len(clips) - 1 else "alast"
+            parts.append(f"[{a_prev}][a{i}]acrossfade=d={duration}[{out_label}]")
+            a_prev = out_label
+
+    # 首尾淡入淡出（视频 fade / 音频 afade）；未开启时 null/anull 透传
+    if fade_in > 0 or fade_out > 0:
+        v_fades = []
+        a_fades = []
+        if fade_in > 0:
+            v_fades.append(f"fade=t=in:st=0:d={fade_in}")
+            a_fades.append(f"afade=t=in:st=0:d={fade_in}")
+        if fade_out > 0:
+            v_fades.append(f"fade=t=out:st={acc - fade_out:.6f}:d={fade_out}")
+            a_fades.append(f"afade=t=out:st={acc - fade_out:.6f}:d={fade_out}")
+        parts.append(f"[vlast]{','.join(v_fades)}[vout]")
+        parts.append(f"[alast]{','.join(a_fades)}[aout]")
+    else:
+        parts.append("[vlast]null[vout]")
+        parts.append("[alast]anull[aout]")
 
     return ";".join(parts)
 
@@ -295,7 +338,7 @@ def splice(
     overwrite: bool,
 ) -> None:
     """执行拼接转场；先写 *.part 临时文件，成功后原子改名。"""
-    filter_complex = build_filter_complex(clips, transitions, duration)
+    filter_complex = build_filter_complex(clips, transitions, duration, FADE_IN, FADE_OUT)
     tmp = output.with_name(f"{output.stem}.part{output.suffix}")
     if tmp.exists():
         tmp.unlink()
@@ -370,23 +413,26 @@ def main(argv: list[str] | None = None) -> int:
         print(f"错误：{in_dir} 下至少需要 2 个视频文件（当前 {len(files)} 个）", file=sys.stderr)
         return 1
 
-    try:
-        supported = get_supported_transitions(ffmpeg)
-    except subprocess.CalledProcessError:
-        print("错误：无法获取 ffmpeg xfade 转场列表", file=sys.stderr)
-        return 1
-    if TRANSITION != "random" and TRANSITION not in supported:
-        listed = ", ".join(f"{n}（{TRANSITION_HELP.get(n, '')}）" for n in sorted(supported))
-        print(f"错误：未知转场 {TRANSITION!r}。本机 ffmpeg 支持的转场：{listed}", file=sys.stderr)
-        return 1
-    unknown = [t for t in TRANSITION_POOL if t not in supported]
-    if unknown:
-        listed = ", ".join(f"{n}（{TRANSITION_HELP.get(n, '')}）" for n in sorted(supported))
-        print(f"错误：TRANSITION_POOL 包含未知转场 {unknown}。可用转场：{listed}", file=sys.stderr)
-        return 1
-    if TRANSITION == "random" and not TRANSITION_POOL:
-        print("错误：TRANSITION 为 random 时 TRANSITION_POOL 不能为空", file=sys.stderr)
-        return 1
+    if TRANSITION != "none":
+        try:
+            supported = get_supported_transitions(ffmpeg)
+        except subprocess.CalledProcessError:
+            print("错误：无法获取 ffmpeg xfade 转场列表", file=sys.stderr)
+            return 1
+        if TRANSITION != "random" and TRANSITION not in supported:
+            listed = ", ".join(f"{n}（{TRANSITION_HELP.get(n, '')}）" for n in sorted(supported))
+            msg = f"错误：未知转场 {TRANSITION!r}。本机 ffmpeg 支持的转场：{listed}"
+            print(msg, file=sys.stderr)
+            return 1
+        unknown = [t for t in TRANSITION_POOL if t not in supported]
+        if unknown:
+            listed = ", ".join(f"{n}（{TRANSITION_HELP.get(n, '')}）" for n in sorted(supported))
+            msg = f"错误：TRANSITION_POOL 包含未知转场 {unknown}。可用转场：{listed}"
+            print(msg, file=sys.stderr)
+            return 1
+        if TRANSITION == "random" and not TRANSITION_POOL:
+            print("错误：TRANSITION 为 random 时 TRANSITION_POOL 不能为空", file=sys.stderr)
+            return 1
 
     clips: list[ClipInfo] = []
     for path in files:
@@ -397,12 +443,25 @@ def main(argv: list[str] | None = None) -> int:
             print(f"错误：读取 {path.name} 失败：{exc}", file=sys.stderr)
             return 1
 
-    short = [c.path.name for c in clips if c.duration < TRANSITION_DURATION]
+    short = [
+        c.path.name for c in clips if TRANSITION != "none" and c.duration < TRANSITION_DURATION
+    ]
     if short:
         print(f"错误：以下片段时长小于转场时长 {TRANSITION_DURATION}s：{short}", file=sys.stderr)
         return 1
 
     transitions = pick_transitions(clips, TRANSITION, TRANSITION_POOL)
+
+    total = sum(c.duration for c in clips)
+    if TRANSITION != "none":
+        total -= TRANSITION_DURATION * (len(clips) - 1)
+    if FADE_IN + FADE_OUT >= total:
+        print(
+            f"错误：淡入 {FADE_IN}s + 淡出 {FADE_OUT}s 不小于成片总时长 {total:.2f}s，"
+            "请调小 FADE_IN / FADE_OUT（设为 0 可关闭）",
+            file=sys.stderr,
+        )
+        return 1
 
     print(f"输入目录：{in_dir}（{len(files)} 个片段，按文件名自然排序）")
     for i, clip in enumerate(clips):
@@ -411,19 +470,23 @@ def main(argv: list[str] | None = None) -> int:
             f"  {i + 1}. {clip.path.name}  "
             f"{clip.width}x{clip.height}@{clip.fps:.2f}fps  {clip.duration:.2f}s{extra}"
         )
+    if not transitions:
+        print("  转场：无（纯拼接，concat 无缝衔接）")
     for i, t in enumerate(transitions):
         hint = TRANSITION_HELP.get(t, "")
         print(f"  转场 {i + 1}（{clips[i].path.name} -> {clips[i + 1].path.name}）：{t}（{hint}）")
 
     output = next_output_path(Path(OUTPUT_DIR), OUTPUT_PREFIX, ".mp4", args.overwrite)
-    print(f"输出：{output}（x264 crf {CRF}，转场 {TRANSITION_DURATION}s）")
+    transition_desc = "无转场" if not transitions else f"转场 {TRANSITION_DURATION}s"
+    print(
+        f"输出：{output}（x264 crf {CRF}，{transition_desc}，淡入 {FADE_IN}s / 淡出 {FADE_OUT}s）"
+    )
     try:
         splice(ffmpeg, clips, transitions, TRANSITION_DURATION, output, args.overwrite)
     except RuntimeError as exc:
         print(f"错误：{exc}", file=sys.stderr)
         return 1
 
-    total = sum(c.duration for c in clips) - TRANSITION_DURATION * (len(clips) - 1)
     print(f"完成：{output}，预计总时长 {total:.2f}s")
     return 0
 

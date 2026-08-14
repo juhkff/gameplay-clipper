@@ -23,6 +23,8 @@ media/
 cut_output/
 connect_output/
 highlight_output/
+bgm_output/
+compress_output/
 *.mp4
 *.mov
 *.mkv

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gameplay-clipper"
 version = "0.1.0"
-description = "游戏实况剪辑、拼接转场、精彩集锦制作工具集"
+description = "游戏实况剪辑工具集：裁剪、拼接转场、BGM 混音、压缩转码、精彩集锦"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -14,10 +14,7 @@ authors = [{ name = "gameplay-clipper contributors" }]
 dependencies = []
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=8",
-    "ruff>=0.6",
-]
+dev = ["pytest>=8", "ruff>=0.6"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

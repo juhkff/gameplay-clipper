@@ -124,6 +124,10 @@ class TestPickTransitions:
             "fade",
         ]
 
+    def test_none_returns_empty(self):
+        clips = [make_clip(f"c{i}.mp4", 5) for i in range(3)]
+        assert splice.pick_transitions(clips, "none", ["fade"]) == []
+
 
 class TestBuildFilterComplex:
     def test_chain(self):
@@ -136,11 +140,56 @@ class TestBuildFilterComplex:
         # 视频统一与转场链：offset = 已拼接时长 - 转场时长
         assert "[0:v]setpts=PTS-STARTPTS,scale=320:240" in fc
         assert "[v0][v1]xfade=transition=fade:duration=1.0:offset=4.000000[xv1]" in fc
-        assert "[xv1][v2]xfade=transition=dissolve:duration=1.0:offset=9.000000[vout]" in fc
+        assert "[xv1][v2]xfade=transition=dissolve:duration=1.0:offset=9.000000[vlast]" in fc
         # 音频：无音轨片段用静音填充
         assert "anullsrc=r=48000:cl=stereo,atrim=duration=7.000000" in fc
         assert "[a0][a1]acrossfade=d=1.0[xa1]" in fc
-        assert "[xa1][a2]acrossfade=d=1.0[aout]" in fc
+        assert "[xa1][a2]acrossfade=d=1.0[alast]" in fc
+        # 无 fade 配置时 null/anull 透传，输出标签恒为 vout/aout
+        assert "[vlast]null[vout]" in fc
+        assert "[alast]anull[aout]" in fc
+
+    def test_fade_in_out(self):
+        clips = [
+            make_clip("a.mp4", 5.0),
+            make_clip("b.mp4", 6.0),
+            make_clip("c.mp4", 7.0),
+        ]
+        fc = splice.build_filter_complex(clips, ["fade", "dissolve"], 1.0, 0.5, 1.0)
+        # 总时长 = 5 + 6 + 7 - 2*1 = 16s；片尾淡出 st = 16 - 1 = 15
+        assert "[vlast]fade=t=in:st=0:d=0.5,fade=t=out:st=15.000000:d=1.0[vout]" in fc
+        assert "[alast]afade=t=in:st=0:d=0.5,afade=t=out:st=15.000000:d=1.0[aout]" in fc
+        assert "null" not in fc
+
+    def test_fade_out_only(self):
+        clips = [make_clip("a.mp4", 5.0), make_clip("b.mp4", 6.0)]
+        fc = splice.build_filter_complex(clips, ["fade"], 1.0, 0.0, 2.0)
+        # 总时长 = 5 + 6 - 1 = 10s；片尾淡出 st = 10 - 2 = 8
+        assert "[vlast]fade=t=out:st=8.000000:d=2.0[vout]" in fc
+        assert "[alast]afade=t=out:st=8.000000:d=2.0[aout]" in fc
+        assert "t=in" not in fc
+
+    def test_concat_no_transitions(self):
+        clips = [
+            make_clip("a.mp4", 5.0),
+            make_clip("b.mp4", 6.0, audio=False),
+            make_clip("c.mp4", 7.0),
+        ]
+        fc = splice.build_filter_complex(clips, [], 1.0)
+        # 无转场：concat 无缝拼接，输入按 v/a 交错，输出 vlast/alast
+        assert "[v0][a0][v1][a1][v2][a2]concat=n=3:v=1:a=1[vlast][alast]" in fc
+        assert "xfade" not in fc
+        assert "acrossfade" not in fc
+        assert "[vlast]null[vout]" in fc
+        assert "[alast]anull[aout]" in fc
+
+    def test_concat_with_fade(self):
+        clips = [make_clip("a.mp4", 5.0), make_clip("b.mp4", 6.0)]
+        fc = splice.build_filter_complex(clips, [], 1.0, 0.5, 2.0)
+        # concat 成片时长 = 5 + 6 = 11s；片尾淡出 st = 11 - 2 = 9
+        assert "concat=n=2:v=1:a=1[vlast][alast]" in fc
+        assert "[vlast]fade=t=in:st=0:d=0.5,fade=t=out:st=9.000000:d=2.0[vout]" in fc
+        assert "[alast]afade=t=in:st=0:d=0.5,afade=t=out:st=9.000000:d=2.0[aout]" in fc
 
     def test_unifies_to_first_clip_resolution(self):
         clips = [

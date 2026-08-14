@@ -47,6 +47,45 @@ class TestNextOutputPath:
         )
 
 
+class TestBuildCutCommand:
+    def test_stream_copy(self, tmp_path):
+        cmd = cut.build_cut_command(
+            "ffmpeg",
+            tmp_path / "v.mp4",
+            "00:00:05",
+            "00:00:10",
+            tmp_path / "out.mp4",
+            overwrite=False,
+            exact=False,
+        )
+        assert cmd[:4] == ["ffmpeg", "-n", "-ss", "00:00:05"]
+        assert "-to" in cmd and "00:00:10" in cmd
+        # stream copy：-ss 在 -i 之前，-c copy 不重编码
+        assert cmd.index("-ss") < cmd.index("-i")
+        assert cmd[cmd.index("-c") + 1] == "copy"
+        assert cmd[-1] == str(tmp_path / "out.mp4")
+
+    def test_exact_reencode(self, tmp_path):
+        cmd = cut.build_cut_command(
+            "ffmpeg",
+            tmp_path / "v.mp4",
+            "00:00:05",
+            "00:00:10",
+            tmp_path / "out.mp4",
+            overwrite=True,
+            exact=True,
+        )
+        assert cmd[1] == "-y"
+        # 帧级精确：-ss 在 -i 之后（output seeking），重编码 libx264
+        assert cmd.index("-ss") > cmd.index("-i")
+        assert cmd[cmd.index("-c:v") + 1] == "libx264"
+        assert cmd[cmd.index("-crf") + 1] == cut.EXACT_CRF
+        assert cmd[cmd.index("-preset") + 1] == cut.EXACT_PRESET
+        assert cmd[cmd.index("-b:a") + 1] == cut.EXACT_AUDIO_BITRATE
+        assert "-map" in cmd and "0:a?" in cmd
+        assert cmd[-1] == str(tmp_path / "out.mp4")
+
+
 class TestMainErrors:
     def test_missing_video(self, tmp_path, capsys, monkeypatch):
         monkeypatch.setattr(cut, "VIDEO_PATH", str(tmp_path / "nope.mp4"))
