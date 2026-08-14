@@ -26,8 +26,8 @@ from gameplay_clipper.detectors import Segment, get_detector
 # ============================================================
 # 配置区（按需修改）
 # ============================================================
-SOURCE: str = "media/recording.mp4"  # 待分析视频（素材统一放 media/）
-DETECTOR: str = "coarse"  # 检测器：coarse / manual / vlm
+SOURCE: str = "media/Apex Legends_08-12-2026_23-28-12-50.mp4"  # 待分析视频（素材统一放 media/）
+DETECTOR: str = "vlm"  # 检测器：coarse / manual / vlm
 OUTPUT_DIR: str = "highlight_output"  # 裁剪产物目录
 OUTPUT_PREFIX: str = "highlight"  # 输出文件名前缀，如 highlight-1.mp4
 HIGHLIGHT_COUNT: int = 5  # 最多取几个精彩片段

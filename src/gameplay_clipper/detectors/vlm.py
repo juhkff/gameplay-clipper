@@ -21,12 +21,13 @@ from gameplay_clipper.detectors import Segment, register
 # ============================================================
 # 配置区（按需修改）
 # ============================================================
-MODEL_ID: str = "Qwen/Qwen2.5-VL-7B-Instruct-AWQ"  # 本地 VLM 模型
-FRAME_INTERVAL: float = 2.0  # 抽帧间隔（秒）；瞬时高光场景可调到 1.0
+MODEL_ID: str = "Vishva007/Qwen3-VL-8B-Instruct-W4A16-AutoRound-AWQ"  # 本地 VLM 模型
+FRAME_INTERVAL: float = 1.0  # 抽帧间隔（秒）；瞬时高光场景可调到 1.0
 SCORE_THRESHOLD: int = 70  # 判定为精彩的分数阈值（0-100）
 SEGMENT_PAD: float = 3.0  # 高光帧合并成片段时前后各扩几秒
-USE_COARSE_PREFILTER: bool = True  # 先用 coarse 粗筛，只送检候选窗口内的帧（省算力）
+USE_COARSE_PREFILTER: bool = False  # 先用 coarse 粗筛，只送检候选窗口内的帧（省算力）
 CACHE_FILE: str = "highlight_output/.vlm_cache.json"  # 帧判定缓存（中断可续跑）
+BATCH_SIZE: int = 8  # 批量推理：每批帧数（GPU 利用率与显存占用的折中）
 PROMPT: str = (
     "你是游戏实况剪辑助手。判断这张游戏画面是否为精彩/高光时刻。"
     "精彩时刻包括：击杀或多杀、团战胜利、极限操作或残血反杀、"
@@ -224,32 +225,115 @@ class VlmDetector:
         """
         import torch  # noqa: F401
         from PIL import Image  # noqa: F401
-        from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+        from transformers import AutoModelForImageTextToText, AutoProcessor, AwqConfig
+        from transformers.utils.quantization_config import AwqBackend
+
+        # transformers 5.15 bug 规避：qwen2_5_vl 的 apply_multimodal_rotary_pos_emb
+        # 没有把 float32 的 cos/sin cast 到 q/k 的 dtype，fp16 模型下激活会被 promote
+        # 成 float32，导致后续 attention matmul 混精度报错（视觉塔的 rope 无此问题）
+        import transformers.models.qwen2_5_vl.modeling_qwen2_5_vl as qwen_vl_modeling
+
+        _orig_mrope = qwen_vl_modeling.apply_multimodal_rotary_pos_emb
+
+        def _patched_mrope(q, k, cos, sin, mrope_section, unsqueeze_dim=1):
+            return _orig_mrope(
+                q, k, cos.to(dtype=q.dtype), sin.to(dtype=q.dtype), mrope_section, unsqueeze_dim
+            )
+
+        qwen_vl_modeling.apply_multimodal_rotary_pos_emb = _patched_mrope
+
+        # 该 AWQ checkpoint 的 config.json 未声明 backend，transformers 默认 auto
+        # 会选到 Marlin 内核，而 Qwen2.5-VL 存在 out_features 不能被 64 整除的层，
+        # Marlin 无法处理；这里显式固定为纯 PyTorch 反量化内核（兼容所有维度）。
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(MODEL_ID)
+        quant_method = None
+        if getattr(cfg, "quantization_config", None):
+            quant_method = cfg.quantization_config.get("quant_method")
 
         print(f"  加载模型 {MODEL_ID}（首次运行需下载，请耐心等待）...")
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
-            MODEL_ID, torch_dtype="auto", device_map="auto"
-        )
+        if quant_method == "awq":
+            quant_config = AwqConfig(
+                bits=4,
+                group_size=128,
+                zero_point=True,
+                backend=AwqBackend.GEMM_TRITON,
+                modules_to_not_convert=[
+                    # transformers 5.x 的 should_convert_module 按 "visual." 前缀匹配，
+                    # 但该架构 named_modules 带 "model." 前缀，需两种写法都写上才能跳过视觉塔
+                    "visual",
+                    "model.visual",
+                ],
+                version="gemm",
+            )
+            model = AutoModelForImageTextToText.from_pretrained(
+                MODEL_ID,
+                dtype=torch.float16,  # 统一 fp16：visual tower 未量化默认 bf16，与 AWQ fp16 混精度会报错
+                device_map="auto",
+                quantization_config=quant_config,
+            )
+            # transformers 对量化模型会忽略 dtype 参数、按 checkpoint 原 dtype 加载未量化
+            # 部分（视觉塔 / embedding 等为 bf16），与 AWQ fp16 内核混精度 matmul 会报错。
+            # 通用方案：把所有浮点参数统一 cast 成 fp16（int32 打包量化权重保持不变）。
+            for param in model.parameters():
+                if param.dtype in (torch.float32, torch.bfloat16):
+                    param.data = param.data.to(torch.float16)
+        else:
+            # FP8 / 原版 checkpoint：transformers 原生 quantizer 处理（FP8 需 torchao，已随
+            # gptqmodel 安装）。浮点参数统一 cast 到计算精度 fp16，fp8 权重保持不动。
+            model = AutoModelForImageTextToText.from_pretrained(
+                MODEL_ID,
+                dtype=torch.float16,
+                device_map="auto",
+            )
+            for param in model.parameters():
+                if param.dtype in (torch.float32, torch.bfloat16):
+                    param.data = param.data.to(torch.float16)
+
+        # attention 的 causal mask 是 float32，会把 fp16 激活 promote 成 float32；
+        # AWQ 量化层内部会 cast 输入所以不报错，但 lm_head 是普通 nn.Linear 会报
+        # 混精度错误，这里给 lm_head 加输入 dtype 兜底（cast 开销可忽略）。
+        # 仅当 lm_head 是普通浮点权重时 patch（fp8 权重交给 transformers 原生处理）
+        if model.lm_head.weight.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            _orig_lm_head_forward = model.lm_head.forward
+
+            def _patched_lm_head(x):
+                return _orig_lm_head_forward(x.to(dtype=model.lm_head.weight.dtype))
+
+            model.lm_head.forward = _patched_lm_head
         processor = AutoProcessor.from_pretrained(MODEL_ID)
 
+        # 所有帧的 prompt 文本相同：chat template 输出只含 <image> 占位标记，
+        # 与具体图像无关，生成一次循环内复用（省每帧 0.5-1s 的 CPU 开销）
+        _dummy_img = Image.new("RGB", (8, 8))
+        _template_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": _dummy_img},
+                    {"type": "text", "text": PROMPT},
+                ],
+            }
+        ]
+        text_template = processor.apply_chat_template(
+            _template_messages, tokenize=False, add_generation_prompt=True
+        )
+
+        # 逐帧推理（GEMM_TRITON 内核下单帧约 1.5s；批量路径在部分内核上会退化，
+        # 保持单帧循环最稳）
         for index, (timestamp, path) in enumerate(pending, start=1):
             image = Image.open(path).convert("RGB")
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": PROMPT},
-                    ],
-                }
-            ]
-            text = processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+            inputs = processor(text=[text_template], images=[image], return_tensors="pt").to(
+                model.device
             )
-            inputs = processor(text=[text], images=[image], return_tensors="pt").to(model.device)
             output_ids = model.generate(**inputs, max_new_tokens=128)
             answer = processor.batch_decode(output_ids, skip_special_tokens=True)[0]
-            # 答案里混有模板文本，取 JSON 部分
+            # batch_decode 输出包含完整上下文（system/user/assistant），其中 prompt 自带
+            # JSON 模板示例；直接全文切片会误切到模板文本，导致解析结果恒为 0。
+            # 先只取最后一个 assistant 回复段，再截 JSON 部分。
+            if "assistant" in answer:
+                answer = answer.split("assistant")[-1]
             answer = answer[answer.find("{") : answer.rfind("}") + 1]
             result = parse_response(answer)
             cache.put(cache_key, timestamp, result)
