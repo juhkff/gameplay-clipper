@@ -13,9 +13,12 @@ x264 + crf 重编码（参数与 splice 保持一致风格），可选缩放分�
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from gameplay_clipper.common import next_output_path
@@ -72,9 +75,50 @@ def build_command(
         audio_bitrate,
         "-movflags",
         "+faststart",
+        "-progress",
+        "pipe:1",  # key=value 进度写到 stdout，供实时显示；日志仍在 stderr
         str(output),
     ]
     return cmd
+
+
+def parse_progress(line: str, duration: float | None) -> float | None:
+    """从 `-progress pipe:1` 输出行解析进度百分比（0~100）。
+
+    支持 out_time_us / out_time_ms（旧版 ffmpeg）；时长未知或行无关返回 None。
+    """
+    match = re.match(r"out_time_(us|ms)=(\d+)", line)
+    if not match:
+        return None
+    micros = int(match.group(2))
+    if match.group(1) == "ms":
+        micros *= 1000
+    if not duration or duration <= 0:
+        return None
+    return min(micros / 1e6 / duration * 100.0, 100.0)
+
+
+def probe_duration(ffprobe: str, path: Path) -> float | None:
+    """探测输入视频时长（秒）；失败返回 None（进度降级为无百分比）。"""
+    try:
+        out = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        return float(out) if out else None
+    except (subprocess.CalledProcessError, ValueError):
+        return None
 
 
 def human_size(nbytes: float) -> str:
@@ -89,19 +133,56 @@ def compress(
     source: Path,
     output: Path,
     overwrite: bool,
+    duration: float | None = None,
 ) -> None:
-    """压缩单个文件；先写 *.part 临时文件，成功后原子改名。"""
+    """压缩单个文件；先写 *.part 临时文件，成功后原子改名。
+
+    duration 已知时实时刷新进度百分比（ffmpeg -progress 输出）；
+    未知（未装 ffprobe 或探测失败）则静默执行。
+    stderr 落临时文件，避免管道填满死锁，失败时取尾部信息报错。
+    """
     tmp = output.with_name(f"{output.stem}.part{output.suffix}")
     if tmp.exists():
         tmp.unlink()
     cmd = build_command(ffmpeg, source, tmp, overwrite, CRF, PRESET, AUDIO_BITRATE, RESIZE, FPS)
+
+    fd, err_name = tempfile.mkstemp(prefix="gc-compress-", suffix=".err")
+    os.close(fd)
+    err_path = Path(err_name)
+    proc: subprocess.Popen[str] | None = None
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as exc:
-        if tmp.exists():
-            tmp.unlink()
-        tail = exc.stderr.strip().splitlines()[-5:]
-        raise RuntimeError(f"压缩 {source.name} 失败：" + " | ".join(tail)) from exc
+        with open(err_path, "w", encoding="utf-8") as err_f:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=err_f,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            assert proc.stdout is not None
+            shown = False
+            if duration:
+                last_pct = 0.0
+                for line in proc.stdout:
+                    pct = parse_progress(line, duration)
+                    if pct is None:
+                        continue
+                    if pct < last_pct:
+                        continue  # 音视频交错编码时 out_time 可能回退，保持单调
+                    last_pct = pct
+                    print(f"\r  进度 {pct:3.0f}%", end="", flush=True)
+                    shown = True
+            proc.wait()
+        if shown:
+            print()
+        if proc.returncode != 0:
+            tail = err_path.read_text(encoding="utf-8").strip().splitlines()[-5:]
+            raise RuntimeError(f"压缩 {source.name} 失败：" + " | ".join(tail))
+    finally:
+        err_path.unlink(missing_ok=True)
+        if proc is not None and proc.returncode != 0 and tmp.exists():
+            tmp.unlink()  # 失败时清理 *.part 残留；覆盖模式下不动已存在的正式文件
     tmp.replace(output)
 
 
@@ -133,6 +214,9 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        print("提示：未找到 ffprobe，压缩过程不显示进度百分比")
 
     sources = resolve_inputs(INPUT)
     if not sources:
@@ -157,8 +241,9 @@ def main(argv: list[str] | None = None) -> int:
         output = next_output_path(Path(OUTPUT_DIR), OUTPUT_PREFIX, suffix, args.overwrite)
         size_in = source.stat().st_size
         print(f"[{i}/{len(sources)}] {source.name}（{human_size(size_in)}）=> {output.name}")
+        duration = probe_duration(ffprobe, source) if ffprobe else None
         try:
-            compress(ffmpeg, source, output, args.overwrite)
+            compress(ffmpeg, source, output, args.overwrite, duration)
         except RuntimeError as exc:
             print(f"错误：{exc}", file=sys.stderr)
             return 1

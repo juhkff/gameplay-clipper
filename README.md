@@ -115,6 +115,8 @@ python -m gameplay_clipper.bgm --overwrite  # 允许覆盖
   - `RESIZE`：目标分辨率（如 `"1280:720"`，留空保持原分辨率）
   - `FPS`：统一帧率（如 30，0 = 保持原帧率）
 - 压缩完成后打印输出体积与压缩率
+- 处理时**实时显示进度百分比**（基于 ffprobe 探测时长 + ffmpeg `-progress`；
+  未安装 ffprobe 或探测失败时自动降级为静默执行）
 - 输出命名 `compress-1.mp4`、`compress-2.mp4`……默认不覆盖
 
 ```bash
