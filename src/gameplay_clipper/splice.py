@@ -39,6 +39,12 @@ TRANSITION_POOL: list[str] = ["fade", "dissolve", "wipeleft"]
 
 TRANSITION_DURATION: float = 1.0  # 转场时长（秒）；每段视频时长必须不小于它
 
+# 响度归一化（EBU R128）：各单元独立归一化到目标响度，多段素材音量不一致时统一听感。
+# 两遍式 linear 模式（先测量后应用，无动态压缩损失）。目标响度建议：
+# -14 LUFS（流媒体/B站常用）~ -16 LUFS（短视频平台常用，声音更响）。
+LOUDNESS: bool = True
+LOUDNESS_TARGET: float = -16.0
+
 # 视频编码器与质量：
 # - ENCODER="auto"：优先 h264_nvenc（NVIDIA 硬件编码，快 5-10 倍），不可用时回退 libx264
 # - ENCODER="libx264" / "h264_nvenc"：强制指定
@@ -440,6 +446,75 @@ def build_timeline(
     return units, t
 
 
+def _audio_chain(inp: str, start: float, end: float, label: str, has_audio: bool) -> str:
+    """音频预处理链：截取区间 → 统一 48kHz 立体声浮点格式。"""
+    if has_audio:
+        return (
+            f"[{inp}:a]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS,"
+            f"aresample=48000,pan=stereo|c0=c0|c1=c0,"
+            f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[{label}]"
+        )
+    return (
+        f"anullsrc=r=48000:cl=stereo,atrim=duration={end - start:.6f},asetpts=PTS-STARTPTS[{label}]"
+    )
+
+
+def _loudnorm_filter(target: float, measured: dict | None = None) -> str:
+    """loudnorm 滤镜参数：无 measured 时为测量模式（json），有则为两遍式应用（linear）。"""
+    base = f"I={target}:TP=-1.5:LRA=11"
+    if measured:
+        return (
+            f"loudnorm={base}"
+            f":measured_I={measured['input_i']}:measured_TP={measured['input_tp']}"
+            f":measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}"
+            f":linear=true:print_format=summary"
+        )
+    return f"loudnorm={base}:print_format=json"
+
+
+def _measure_loudness(
+    ffmpeg: str,
+    unit: TimelineUnit,
+    clips: list[ClipInfo],
+    duration: float,
+) -> dict:
+    """第一遍：测量单元音频的响度参数（input_i/input_tp/input_lra/input_thresh）。"""
+    parts: list[str] = []
+    if unit.kind == "segment":
+        parts.append(
+            _audio_chain("0", unit.src_start, unit.src_end, "a0", clips[unit.index].has_audio)
+        )
+    else:
+        other = unit.other_index
+        assert other is not None
+        parts.append(
+            _audio_chain("0", unit.src_start, unit.src_end, "a0", clips[unit.index].has_audio)
+        )
+        parts.append(
+            _audio_chain("1", unit.other_start, unit.other_end, "a1", clips[other].has_audio)
+        )
+        parts.append(f"[a0][a1]acrossfade=d={duration}[aloud]")
+        parts.append(f"[aloud]{_loudnorm_filter(LOUDNESS_TARGET)}")
+    if unit.kind == "segment":
+        parts.append(f"[a0]{_loudnorm_filter(LOUDNESS_TARGET)}")
+
+    cmd = [ffmpeg, "-hide_banner", "-i", str(clips[unit.index].path)]
+    if unit.other_index is not None:
+        cmd += ["-i", str(clips[unit.other_index].path)]
+    cmd += ["-filter_complex", ";".join(parts), "-f", "null", "-"]
+    try:
+        out = subprocess.run(cmd, check=True, capture_output=True, text=True).stderr
+    except subprocess.CalledProcessError:
+        # 测量失败（如纯静音）时回退为不归一化
+        return {}
+    result: dict = {}
+    for key in ("input_i", "input_tp", "input_lra", "input_thresh"):
+        m = re.search(rf'"{key}"\s*:\s*"?(-?[\d.]+)"?', out)
+        if m:
+            result[key] = m.group(1)
+    return result
+
+
 def build_unit_filter_complex(
     unit: TimelineUnit,
     clips: list[ClipInfo],
@@ -450,8 +525,13 @@ def build_unit_filter_complex(
     total: float,
     fade_in: float,
     fade_out: float,
+    loudness_args: dict | None = None,
 ) -> str:
-    """构建单个时间线单元的 filter_complex（局部输入编号 0/1）。"""
+    """构建单个时间线单元的 filter_complex（局部输入编号 0/1）。
+
+    loudness_args 非空时在混音链之后应用两遍式 loudnorm（linear），
+    空 dict 表示测量失败（保持原音量）；None 表示关闭归一化。
+    """
     parts: list[str] = []
 
     def _video_chain(inp: str, start: float, end: float, label: str) -> str:
@@ -459,18 +539,6 @@ def build_unit_filter_complex(
             f"[{inp}:v]trim=start={start:.6f}:end={end:.6f},setpts=PTS-STARTPTS,"
             f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}[{label}]"
-        )
-
-    def _audio_chain(inp: str, start: float, end: float, label: str, has_audio: bool) -> str:
-        if has_audio:
-            return (
-                f"[{inp}:a]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS,"
-                f"aresample=48000,pan=stereo|c0=c0|c1=c0,"
-                f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[{label}]"
-            )
-        return (
-            f"anullsrc=r=48000:cl=stereo,atrim=duration={end - start:.6f},"
-            f"asetpts=PTS-STARTPTS[{label}]"
         )
 
     if unit.kind == "segment":
@@ -494,6 +562,13 @@ def build_unit_filter_complex(
         )
         parts.append(f"[a0][a1]acrossfade=d={duration}[aout]")
 
+    # 响度归一化：在混音链之后、淡入淡出之前应用（linear 两遍式）。
+    # loudness_args 为 None 关闭；空 dict 表示测量失败，保持原音量。
+    a_mix = "aout"
+    if loudness_args:
+        parts.append(f"[aout]{_loudnorm_filter(LOUDNESS_TARGET, loudness_args)}[aloud]")
+        a_mix = "aloud"
+
     # 首尾淡入淡出：仅当落在本单元覆盖的时间线区间时叠加
     v_fades: list[str] = []
     a_fades: list[str] = []
@@ -509,10 +584,10 @@ def build_unit_filter_complex(
             a_fades.append(f"afade=t=out:st={st:.6f}:d={fade_out}")
     if v_fades:
         parts.append(f"[vout]{','.join(v_fades)}[vfinal]")
-        parts.append(f"[aout]{','.join(a_fades)}[afinal]")
+        parts.append(f"[{a_mix}]{','.join(a_fades)}[afinal]")
     else:
         parts.append("[vout]null[vfinal]")
-        parts.append("[aout]anull[afinal]")
+        parts.append(f"[{a_mix}]anull[afinal]")
 
     return ";".join(parts)
 
@@ -530,9 +605,20 @@ def encode_unit(
     fade_out: float,
     out: Path,
 ) -> None:
-    """编码单个时间线单元（1-2 路输入，内存恒定）。"""
+    """编码单个时间线单元（1-2 路输入，内存恒定）。
+
+    开启响度归一化（LOUDNESS）时先测量单元响度，再以 linear 模式应用，
+    保证各单元（多段素材）听感响度一致。
+    """
+    loudness_args: dict | None = None
+    if LOUDNESS:
+        has_any_audio = clips[unit.index].has_audio or (
+            unit.other_index is not None and clips[unit.other_index].has_audio
+        )
+        if has_any_audio:
+            loudness_args = _measure_loudness(ffmpeg, unit, clips, duration)
     fc = build_unit_filter_complex(
-        unit, clips, width, height, fps, duration, total, fade_in, fade_out
+        unit, clips, width, height, fps, duration, total, fade_in, fade_out, loudness_args
     )
     cmd = [ffmpeg, "-y", "-hwaccel", "cuda", "-i", str(clips[unit.index].path)]
     if unit.other_index is not None:
