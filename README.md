@@ -35,7 +35,11 @@ python -m gameplay_clipper.cut --exact     # 帧级精确裁剪（重编码）
 依次拼接，相邻片段之间插入转场（视频 `xfade` + 音频 `acrossfade`），输出到
 `connect_output/`（默认）。
 
-- 依赖 `ffmpeg` 与 `ffprobe`；转场需要重编码：libx264 + crf 23（可改）
+**NLE 式时间线切分**：按转场把片段切成主体/转场单元，各自独立编码（任意时刻
+仅 1-2 路输入），最后 `concat -c copy` 无损合并——内存峰值与片段总数无关，
+片段再多也不会 OOM；单元之间并行编码，每段内容只编码一次。
+
+- 依赖 `ffmpeg` 与 `ffprobe`；转场需要重编码
 - 配置写死在代码顶部配置区（`src/gameplay_clipper/splice.py`）：
   - `INPUT_DIR`：待拼接视频所在文件夹
   - `OUTPUT_DIR` / `OUTPUT_PREFIX`：输出目录（默认 `connect_output`）与文件名前缀
@@ -46,6 +50,15 @@ python -m gameplay_clipper.cut --exact     # 帧级精确裁剪（重编码）
     全部列表见配置区注释）
   - `TRANSITION_DURATION`：转场时长（秒），每段视频时长必须不小于它
   - `FADE_IN` / `FADE_OUT`：成片首尾淡入淡出（秒，设为 0 关闭；默认 0.5s / 1.0s）
+  - `ENCODER`：视频编码器。`"auto"`（默认）自动探测 `h264_nvenc`（NVIDIA 硬件
+    编码，快 5-10 倍，同画质体积略大），不可用时回退 `libx264`；也可强制
+    `"libx264"` / `"h264_nvenc"`
+  - `CRF`：质量参数（libx264 的 crf / NVENC 的 cq；默认 26，越小越好，
+    23 近无损 / 26 推荐 / 28 省体积）
+  - `PRESET`：编码速度预设（libx264: ultrafast..veryslow；NVENC: p1..p7）
+  - `LOUDNESS` / `LOUDNESS_TARGET`：响度归一化（EBU R128 两遍式 loudnorm，
+    默认开启，目标 -16 LUFS）。多段素材音量不一致时统一听感，无音轨单元
+    自动跳过
 - 片段分辨率/帧率不同会自动统一到最高规格；无音轨的片段用静音填充
 - 输出命名 `connect-1.mp4`、`connect-2.mp4`……默认不覆盖，传 `--overwrite` 允许覆盖
 
